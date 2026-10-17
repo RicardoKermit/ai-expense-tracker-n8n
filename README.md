@@ -156,16 +156,6 @@ Dashboard formulas, formatting, and charts are maintained **in Google Sheets**, 
 - [ ] Optional local-file backup alongside Google Drive.
 - [ ] Reproducible deployment instructions and sample Google Sheets template.
 
-## Repository layout
-
-```text
-ai-expense-tracker-n8n/
-├── README.md
-├── workflows/
-│   └── expense-tracker.json
-└── screenshots/           # Optional, sanitized screenshots
-```
-
 ## Privacy and security
 
 The public workflow should contain **no OAuth tokens, API keys, personal email addresses, personal Drive folder IDs, or private spreadsheet IDs**. Set your own credentials and resource IDs *after* importing into n8n. Before publishing modifications, review node parameters, JavaScript expressions, pinned data, exported metadata, and screenshots for sensitive information.
@@ -174,4 +164,4 @@ Keep real invoice images and personal expense records out of the repository. Use
 
 ## License
 
-A license has not been selected yet. Add a `LICENSE` file if you intend to define reuse and distribution terms.
+A license has not been selected yet.
