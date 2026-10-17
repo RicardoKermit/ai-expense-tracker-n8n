@@ -1,0 +1,633 @@
+{
+  "name": "Despesas - processamento sequencial",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "readStatus": "unread"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        96
+      ],
+      "id": "fbd66c30-6c86-401a-9fdd-779d65f83670",
+      "name": "Gmail Trigger",
+      "executeOnce": false,
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "name": "={{ $json.filename }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_DRIVE_FOLDER_ID"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        832,
+        256
+      ],
+      "id": "d5003ba9-0a7f-4912-9c36-cb18f0b0bed8",
+      "name": "Upload file"
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5vl:3b",
+          "mode": "list",
+          "cachedResultName": "qwen2.5vl:3b"
+        },
+        "text": "\nAnalisa esta fatura portuguesa e extrai os seguintes campos:\n\nsupplier: nome legal do fornecedor\nsupplierNif: NIF do fornecedor\ninvoiceNumber: número da fatura\ninvoiceDate: data da fatura no formato YYYY-MM-DD\ntotal: valor final da fatura, com IVA incluído\natcud: ATCUD, caso exista\n\nRegras:\n- Devolve exclusivamente um objeto JSON válido.\n- Utiliza um número JSON para o valor monetário, sem símbolo de moeda.\n- Utiliza null quando não conseguires identificar um campo.\n- Não inventes valores.\n- O campo total deve representar o montante final a pagar, com IVA incluído.\n- Não confundas o total com o subtotal, a base tributável, o valor do IVA ou o troco.\n- Se existirem vários valores monetários, identifica o total final da fatura.\n- Não incluas os campos subtotal ou vat na resposta.\n- Não acrescentes explicações nem blocos Markdown.\n  ",
+        "simplify": false,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [
+        832,
+        -64
+      ],
+      "id": "60b22310-c9c0-439b-9023-1f0de1b060e7",
+      "name": "Analyze image",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\n/* === 1. Parse Ollama response === */\n\nconst raw = $json.message?.content ?? \"\"; // resposta do Ollama; se não existir, usamos texto vazio\n\nconst cleaned = raw // remove caracteres desnecessários da resposta\n  .replace(/```json\\s*/gi, \"\")\n  .replace(/```\\s*/g, \"\")\n  .trim();\n\nlet invoice;\nlet error = null;\n\ntry {\n  invoice = JSON.parse(cleaned); // transforma uma string JSON num objeto JavaScript\n\n  // Verifica se o resultado é realmente um objeto e não null, array ou outro tipo\n  if (\n    invoice === null ||\n    typeof invoice !== \"object\" ||\n    Array.isArray(invoice)\n  ) {\n    throw new Error(\"Invalid JSON object\");\n  }\n\n} catch (err) {\n  invoice = null;\n  error = \"invalid_ollama_response\";\n}\n\n/* === 2. Handle invalid Ollama response === */\n\nif (invoice === null) { // se a resposta for inválida, devolvemos os campos a null\n\n  return {\n    json: {\n      supplier: null,\n      supplierNif: null,\n      invoiceNumber: null,\n      invoiceDate: null,\n      total: null,\n      atcud: null,\n      attachmentId: $('Extraia anexos').item.json.attachmentId,\n      hasValidDate: false,\n      hasValidTotal: false,\n      status: \"pending_review\",\n      error\n    }\n  };\n}\n\n/* === 3. Validate date === */\n\nconst hasValidDate =\n  typeof invoice.invoiceDate === \"string\" && // verifica se a data é texto\n  /^\\d{4}-\\d{2}-\\d{2}$/.test(invoice.invoiceDate) && // verifica o formato YYYY-MM-DD\n  (() => {\n    const [year, month, day] = invoice.invoiceDate\n      .split(\"-\") // transforma \"2026-08-18\" em [\"2026\", \"08\", \"18\"]\n      .map(Number); // converte os textos em números [2026, 8, 18]\n\n    const date = new Date(Date.UTC(year, month - 1, day)); // cria uma data em UTC\n\n    return ( // confirma que a data criada corresponde à data original\n      date.getUTCFullYear() === year &&\n      date.getUTCMonth() === month - 1 &&\n      date.getUTCDate() === day\n    );\n  })();\n\n/* === 4. Validate total === */\n\n/**\n * Exigimos que o total seja:\n * - Um número finito.\n * - Maior ou igual a zero.\n */\n\nconst hasValidTotal =\n  Number.isFinite(invoice.total) && // verifica se é um número válido\n  invoice.total >= 0; // verifica se não é negativo\n\n/* === 5. Determine invoice status === */\n\n/**\n * Para atribuir \"validated\", precisamos de:\n * - Data válida.\n * - Total válido.\n *\n * Já não verificamos subtotal + IVA = total.\n */\n\nlet status;\n\nif (\n  hasValidDate &&\n  hasValidTotal\n) {\n  status = \"validated\";\n} else {\n  status = \"pending_review\";\n}\n\n/* === 6. Return structured data === */\n\nreturn { // cria o item que vai seguir para o Merge e Google Sheets\n  json: {\n    supplier: invoice.supplier ?? null,\n    supplierNif: invoice.supplierNif ?? null,\n    invoiceNumber: invoice.invoiceNumber ?? null,\n    invoiceDate: invoice.invoiceDate ?? null,\n    total: invoice.total ?? null,\n    atcud: invoice.atcud ?? null,\n\n    // Recupera o identificador do anexo original\n    attachmentId: $('Extraia anexos').item.json.attachmentId,\n\n    hasValidDate,\n    hasValidTotal,\n    status\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1056,
+        -64
+      ],
+      "id": "a98b5792-c7e7-4c78-b9bc-e0a090cbd940",
+      "name": "Limpa mensagem"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all(); //Obter os dados de entrada\nconst result = [];\n\nconst allowedTypes = [\n  \"application/pdf\",\n  \"image/jpeg\",\n  \"image/png\"\n];\n\n//percorre todos os emails recebidos\nfor (const [itemIndex, item] of items.entries()) {\n\n  //busca chave dos ficheiros\n  const keys = Object.keys(item.binary ?? {});\n\n  //percorre por cada chave\n  for (const key of keys) {\n\n    //busca chave de um ficheiro\n    const attachment = item.binary[key];\n\n    //Id único do documento\n    const attachmentId = `${item.json.id}_${key}`;\n    \n    // Aqui estamos a trabalhar com um anexo específico.\n    // verifica se é dos tipos permitidos\n    if (allowedTypes.includes(attachment.mimeType)) {\n     //adiciona ao array um json com a chave, nome e tipo\n      result.push({\n        json:{\n          attachmentId: attachmentId,\n          key: key,\n          filename: attachment.fileName,\n          mimeType: attachment.mimeType\n        },\n        binary: {data: attachment},\n        pairedItem: {item: itemIndex}\n      })\n    }\n  }\n}\n\nreturn result;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        96
+      ],
+      "id": "6906f9fa-685b-49e2-afd1-9ece19f4f98d",
+      "name": "Extraia anexos"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Despesas"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "fileName",
+              "displayName": "fileName",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "driveFileId",
+              "displayName": "driveFileId",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "driveFileUrl",
+              "displayName": "driveFileUrl",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "supplier",
+              "displayName": "supplier",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "supplierNif",
+              "displayName": "supplierNif",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "invoiceNumber",
+              "displayName": "invoiceNumber",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "invoiceDate",
+              "displayName": "invoiceDate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total",
+              "displayName": "total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "atcud",
+              "displayName": "atcud",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "financialStatus",
+              "displayName": "financialStatus",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "hasFinancialValues",
+              "displayName": "hasFinancialValues",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "hasValidDate",
+              "displayName": "hasValidDate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "hasValidTotal",
+              "displayName": "hasValidTotal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1712,
+        96
+      ],
+      "id": "370b19ac-ecc8-445e-8c48-e97745d1c5c7",
+      "name": "Append row in sheet",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "fieldsToMatchString": "attachmentId",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1264,
+        96
+      ],
+      "id": "6257bc79-b513-471a-abb5-9bc6f711de80",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "9a896950-af52-4747-bca6-d946424006de",
+              "name": "attachmentId",
+              "value": "={{ $('Extraia anexos').item.json.attachmentId }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1056,
+        256
+      ],
+      "id": "55c1828f-8c3b-4adf-9cff-52427fe73daa",
+      "name": "Recupera ID"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ac668ed4-18cd-4c47-bb7a-3b01caab1ca4",
+              "name": "fileName",
+              "value": "={{ $json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "7dc42c64-d707-4011-bb4c-f242f29a6f60",
+              "name": "driveFileId",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "653923dc-da00-4407-bf8a-ff4b68c02c2e",
+              "name": "driveFileUrl",
+              "value": "={{ $json.webViewLink }}",
+              "type": "string"
+            },
+            {
+              "id": "a6264c7c-3e61-42da-ab75-7f14ed27c87a",
+              "name": "supplier",
+              "value": "={{ $json.supplier }}",
+              "type": "string"
+            },
+            {
+              "id": "c552fe7b-25e8-43dc-b8dc-dd21b90622e2",
+              "name": "supplierNif",
+              "value": "={{ $json.supplierNif }}",
+              "type": "string"
+            },
+            {
+              "id": "44e6a3b1-2ba7-4f5d-ad89-81dddc1acec3",
+              "name": "invoiceNumber",
+              "value": "={{ $json.invoiceNumber }}",
+              "type": "string"
+            },
+            {
+              "id": "a7e2ddbd-5911-4cb6-a9db-d88792dda5c5",
+              "name": "invoiceDate",
+              "value": "={{ $json.invoiceDate }}",
+              "type": "string"
+            },
+            {
+              "id": "7e297b11-0e3e-4ebb-a764-7fc1ed23db80",
+              "name": "total",
+              "value": "={{ $json.total }}",
+              "type": "number"
+            },
+            {
+              "id": "e0147b25-a18d-46f0-bd2e-85d997f5cd12",
+              "name": "atcud",
+              "value": "={{ $json.atcud }}",
+              "type": "string"
+            },
+            {
+              "id": "865840eb-e544-4802-87de-f8169b124055",
+              "name": "hasValidDate",
+              "value": "={{ $json.hasValidDate }}",
+              "type": "boolean"
+            },
+            {
+              "id": "b2b70f63-a794-4a7e-82f1-0886d53aa87c",
+              "name": "hasValidTotal",
+              "value": "={{ $json.hasValidTotal }}",
+              "type": "boolean"
+            },
+            {
+              "id": "4ebfbd9d-711c-4806-82eb-cd3a4cec8f73",
+              "name": "status",
+              "value": "={{ $json.status }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1488,
+        96
+      ],
+      "id": "43a9f488-5ad7-428e-aad6-e3c58f6be04b",
+      "name": "Controi Linha da Sheet"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a20d9e85-f609-4d5b-a60b-da4bad71f578",
+              "leftValue": "={{ ($json.headers?.from ?? \"\").match(/<([^>]+)>/)?.[1]?.toLowerCase() ?? ($json.headers?.from ?? \"\").toLowerCase() }}",
+              "rightValue": "your-email@example.com",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            },
+            {
+              "id": "9d9a05a5-97b3-400f-b531-4a96c79538ef",
+              "leftValue": "={{ ($json.headers?.subject ?? \"\").replace(/^Subject:\\s*/i, \"\").trim().toLowerCase() }}",
+              "rightValue": "n8n",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        224,
+        96
+      ],
+      "id": "d7ac2725-56ca-4a48-9863-08a44a62117f",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "markAsRead",
+        "messageId": "={{ $('Gmail Trigger').item.json.id }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1936,
+        96
+      ],
+      "id": "15716a58-30d2-41c9-a683-498b091be1d6",
+      "name": "Mark a message as read"
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        600,
+        96
+      ],
+      "id": "e3f943ed-6d3f-4409-ab78-c928339a56c1",
+      "name": "Loop Over Items"
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze image": {
+      "main": [
+        [
+          {
+            "node": "Limpa mensagem",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limpa mensagem": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraia anexos": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Mark a message as read",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Controi Linha da Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload file": {
+      "main": [
+        [
+          {
+            "node": "Recupera ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recupera ID": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Controi Linha da Sheet": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Extraia anexos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Analyze image",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark a message as read": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "nodeGroups": [],
+  "tags": []
+}
